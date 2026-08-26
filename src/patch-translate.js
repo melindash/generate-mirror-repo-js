@@ -203,6 +203,17 @@ const makeTranslators = (packageMap) => {
   return {sourceToVendor, vendorToSource};
 };
 
+/**
+ * Paths that exist only in an installed tree and have no source tree
+ * counterpart. Composer generates vendor/bin from package definitions, and
+ * Adobe ships a patch-status marker there to track which isolated patches an
+ * installation has applied. Hunks touching these are dropped rather than
+ * failing the translation, because a source tree port must not contain them.
+ */
+const INSTALL_ONLY = [/^vendor\/bin\//];
+
+const isInstallOnly = (path) => INSTALL_ONLY.some(pattern => pattern.test(path.replace(/^[ab]\//, '')));
+
 // Matches the path-bearing lines of a unified diff. Trailing text after the
 // path (timestamps, tabs) is preserved verbatim.
 const DIFF_GIT = /^(diff --git )(\S+)( )(\S+)(.*)$/;
@@ -230,7 +241,27 @@ const translatePatch = (patchText, packageMap, direction) => {
     throw new Error(`Unknown direction "${direction}", expected to-vendor or to-source`);
   }
 
-  const stats = {translated: 0, untranslated: []};
+  const stats = {translated: 0, untranslated: [], dropped: []};
+
+  // Sections are split on diff --git so a dropped file takes its hunks with it.
+  const sections = [];
+  for (const line of patchText.split('\n')) {
+    if (line.startsWith('diff --git ') || sections.length === 0) sections.push([]);
+    sections[sections.length - 1].push(line);
+  }
+
+  const kept = sections.filter(section => {
+    const header = section[0].match(DIFF_GIT);
+    if (!header) return true;
+    const target = header[4];
+    if (direction === 'to-source' && isInstallOnly(target)) {
+      stats.dropped.push(target.replace(/^[ab]\//, ''));
+      return false;
+    }
+    return true;
+  });
+
+  patchText = kept.map(section => section.join('\n')).join('\n');
 
   const rewrite = (path) => {
     if (path === '/dev/null') return path;
@@ -264,6 +295,7 @@ const translatePatch = (patchText, packageMap, direction) => {
   }).join('\n');
 
   stats.untranslated = [...new Set(stats.untranslated)];
+  stats.dropped = [...new Set(stats.dropped)];
   return {text, stats};
 };
 

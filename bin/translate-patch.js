@@ -61,6 +61,13 @@ if (options.out) {
 console.error(`${packageMap.size} packages mapped from ${ref}`);
 console.error(`${stats.translated} path references translated`);
 
+// Dropped hunks change what the patch does, so they are always reported even
+// though they are not an error.
+if (stats.dropped && stats.dropped.length) {
+  console.error(`${stats.dropped.length} install-only path(s) dropped:`);
+  stats.dropped.forEach(path => console.error(`  ${path}`));
+}
+
 // Anything left untranslated is a path the build does not own: a third party
 // package, or a file outside the packaged tree. Applying such a patch would
 // silently drop those hunks, so fail rather than emit a partial result.

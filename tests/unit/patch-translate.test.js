@@ -195,3 +195,36 @@ describe('translatePatch cases found in the upstream quality-patches corpus', ()
     expect(stats.untranslated).toEqual(['vendor/paypal/module-braintree-core/Model/Ui.php']);
   });
 });
+
+describe('translatePatch install-only paths', () => {
+  const patch = [
+    'diff --git a/vendor/magento/module-cms/Model/Page.php b/vendor/magento/module-cms/Model/Page.php',
+    '--- a/vendor/magento/module-cms/Model/Page.php',
+    '+++ b/vendor/magento/module-cms/Model/Page.php',
+    '@@ -1 +1 @@',
+    '-old',
+    '+new',
+    'diff --git a/vendor/bin/patch-status b/vendor/bin/patch-status',
+    '--- a/vendor/bin/patch-status',
+    '+++ b/vendor/bin/patch-status',
+    '@@ -1 +1 @@',
+    '-marker',
+    '+marker2',
+  ].join('\n');
+
+  it('drops vendor/bin hunks instead of failing the whole patch', () => {
+    const {text, stats} = translatePatch(patch, packageMap, 'to-source');
+
+    expect(stats.untranslated).toEqual([]);
+    expect(stats.dropped).toEqual(['vendor/bin/patch-status']);
+    expect(text).not.toContain('patch-status');
+    expect(text).not.toContain('-marker');
+  });
+
+  it('keeps the rest of the patch intact', () => {
+    const {text} = translatePatch(patch, packageMap, 'to-source');
+
+    expect(text).toContain('--- a/app/code/Magento/Cms/Model/Page.php');
+    expect(text).toContain('+new');
+  });
+});
