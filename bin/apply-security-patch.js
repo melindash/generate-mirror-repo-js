@@ -20,7 +20,7 @@ const parseOptions = require('parse-options');
 const {buildPackageMap, translatePatch} = require('../src/patch-translate');
 
 const options = parseOptions(
-  `$repoDir $patch $branches $label $direction @commit @help|h`,
+  `$repoDir $patch $branches $label $direction @help|h`,
   process.argv
 );
 
@@ -36,10 +36,10 @@ Options:
   --branches=  Comma separated target branches (required), e.g. main,release/3.x
   --label=     Short name used for the created branches (default: security-patch)
   --direction= to-source (default) or none, to skip translation
-  --commit     Commit the applied result on each branch instead of leaving it staged
 
-Creates one branch per target named <label>-<branch>. Conflicts are left in the
-working tree for resolution and reported in the summary.
+Creates and commits one branch per target, named <label>-<branch>, and returns
+the repository to the ref it started on. Conflicts are left in the working tree
+for resolution and reported in the summary.
 `);
   process.exit(1);
 }
@@ -69,6 +69,11 @@ const branchName = (target) => `${label}-${target.replace(/[^A-Za-z0-9._-]/g, '-
 
 const results = [];
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'mageos-patch-'));
+
+// Restored at the end: the tool checks out a branch per target, and leaving the
+// repository on the last one makes a second run fail to check anything out.
+const startingRef = (git(['symbolic-ref', '--quiet', '--short', 'HEAD'], {allowFailure: true})
+  || git(['rev-parse', 'HEAD'], {allowFailure: true}) || '').trim();
 
 for (const target of targets) {
   // The mapping is rebuilt per branch: a module can be added or renamed between
@@ -123,6 +128,23 @@ for (const target of targets) {
     [...applyOutput.matchAll(/error: patch failed: ([^:\n]+):/g)].map(match => match[1])
   )];
 
+  // A file can fail to apply because the fix is already present by another
+  // route, which looks identical to a real conflict in git's output. Comparing
+  // the patch's added lines against the file on disk distinguishes the two well
+  // enough to tell a reviewer where to look. It is a signal, not a proof.
+  const alreadyPresent = (file) => {
+    const target = path.join(repoDir, file);
+    if (!fs.existsSync(target)) return null;
+    const contents = fs.readFileSync(target, 'utf8');
+    const added = translated.text.split('\n')
+      .filter(line => line.startsWith('+') && !line.startsWith('+++'))
+      .map(line => line.slice(1).trim())
+      .filter(line => line.length > 12);
+    if (added.length === 0) return null;
+    const found = added.filter(line => contents.includes(line)).length;
+    return Math.round((found / added.length) * 100);
+  };
+
   const status = git(['status', '--porcelain'], {allowFailure: true}) || '';
   const conflicts = status.split('\n')
     .filter(line => /^(UU|AA|DD|AU|UA|DU|UD) /.test(line))
@@ -134,7 +156,10 @@ for (const target of targets) {
       target,
       status: blockedFiles.length ? 'REJECTED' : 'NO-OP',
       detail: blockedFiles.length
-        ? `rolled back, blocked by: ${blockedFiles.join(' ')}`
+        ? `rolled back, blocked by: ${blockedFiles.map(file => {
+            const pct = alreadyPresent(file);
+            return pct === null ? file : `${file} (${pct}% of added lines already present)`;
+          }).join(' ')}`
         : 'patch produced no changes',
     });
     continue;
@@ -150,14 +175,21 @@ for (const target of targets) {
     continue;
   }
 
-  if (options.commit) {
-    git(['commit', '-m', `Port Adobe security patch ${label}`], {allowFailure: true});
-  }
+  // Always committed: the branch exists only to hold this result, and leaving it
+  // staged means the tool cannot leave the branch, so a second target or a
+  // second run cannot check anything out.
+  git(['commit', '-m', `Port Adobe security patch ${label}`], {allowFailure: true});
 
   results.push({target, status: 'CLEAN', detail: `${applied} files applied`, branch});
 }
 
 fs.rmSync(scratch, {recursive: true, force: true});
+
+if (startingRef) {
+  // Staged results live on their own branches, so returning to the starting ref
+  // does not discard anything.
+  git(['checkout', startingRef], {allowFailure: true});
+}
 
 const widthOf = (key, heading) =>
   Math.max(heading.length, ...results.map(r => String(r[key] || '-').length)) + 2;
