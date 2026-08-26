@@ -150,3 +150,48 @@ describe('translatePatch validation', () => {
     expect(() => translatePatch('', packageMap, 'sideways')).toThrow(/Unknown direction/);
   });
 });
+
+describe('translatePatch cases found in the upstream quality-patches corpus', () => {
+  // Packages whose repository root is the package container, so the module
+  // directory sits at the top level rather than under app/code/Magento.
+  const withRootPackages = new Map([
+    ...packageMap,
+    ['magento/module-inventory-catalog', 'InventoryCatalog'],
+    ['magento/magento2-base', ''],
+  ]);
+
+  const toSourceWith = (patch, map = withRootPackages) =>
+    translatePatch(patch, map, 'to-source');
+
+  it('maps a package that lives at a repository root', () => {
+    const patch = '--- a/vendor/magento/module-inventory-catalog/Model/Source.php';
+
+    expect(toSourceWith(patch).text).toBe('--- a/InventoryCatalog/Model/Source.php');
+  });
+
+  it('maps the base package without leaving a leading slash', () => {
+    const patch = '--- a/vendor/magento/magento2-base/app/etc/di.xml';
+
+    expect(toSourceWith(patch).text).toBe('--- a/app/etc/di.xml');
+  });
+
+  it('passes through paths that are already source relative', () => {
+    const patch = [
+      'diff --git a/lib/web/mage/menu.js b/lib/web/mage/menu.js',
+      '--- a/lib/web/mage/menu.js',
+      '+++ b/lib/web/mage/menu.js',
+    ].join('\n');
+
+    const {text, stats} = toSourceWith(patch);
+
+    expect(text).toBe(patch);
+    expect(stats.untranslated).toEqual([]);
+  });
+
+  it('still refuses an unknown third party vendor package', () => {
+    const patch = '--- a/vendor/paypal/module-braintree-core/Model/Ui.php';
+    const {stats} = toSourceWith(patch);
+
+    expect(stats.untranslated).toEqual(['vendor/paypal/module-braintree-core/Model/Ui.php']);
+  });
+});

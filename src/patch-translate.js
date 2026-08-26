@@ -8,8 +8,11 @@
  * byte-identical files, so the rewrite is total: no content is interpreted.
  */
 
+const fs = require('fs');
+const path = require('path');
 const {execFileSync} = require('child_process');
 const packagesConfig = require('./build-config/packages-config');
+const {buildConfig: releaseInstructions} = require('./build-config/mageos-release-build-config');
 
 /**
  * Directories whose immediate subdirectories are each their own package, as
@@ -17,17 +20,24 @@ const packagesConfig = require('./build-config/packages-config');
  */
 const packageDirsFor = (definition) => (definition.packageDirs || []).map(entry => entry.dir);
 
-const individualDirsFor = (definition) => (definition.packageIndividual || [])
-  .map(entry => entry.dir)
-  // dir '' is the base package, which is every path not claimed by another
-  // entry; it has no directory of its own to map.
-  .filter(dir => typeof dir === 'string' && dir !== '');
+const individualEntriesFor = (definition) => (definition.packageIndividual || [])
+  .filter(entry => typeof entry.dir === 'string');
 
 const readComposerName = (git, dir) => {
   const raw = git(['show', `${git.ref}:${dir}/composer.json`], {allowFailure: true});
   if (!raw) return null;
   try {
     const name = JSON.parse(raw).name;
+    return typeof name === 'string' && name.includes('/') ? name : null;
+  } catch (exception) {
+    return null;
+  }
+};
+
+const templateName = (composerJsonPath) => {
+  if (!composerJsonPath || !fs.existsSync(composerJsonPath)) return null;
+  try {
+    const name = JSON.parse(fs.readFileSync(composerJsonPath, 'utf8')).name;
     return typeof name === 'string' && name.includes('/') ? name : null;
   } catch (exception) {
     return null;
@@ -57,31 +67,97 @@ const gitFor = (repoDir, ref) => {
  * derived from the directory name: module directory CamelCase does not map to
  * package kebab-case by any rule the build itself relies on.
  */
-const buildPackageMap = ({repoDir, ref, definitionKey = 'magento2'}) => {
-  const definition = packagesConfig[definitionKey];
-  if (!definition) {
-    throw new Error(`No package definition "${definitionKey}" in packages-config`);
-  }
-
+const addRepoPackages = (toSource, {repoDir, ref, definition}) => {
   const git = gitFor(repoDir, ref);
-  const toSource = new Map();
 
   for (const dir of packageDirsFor(definition)) {
     const listing = git(['ls-tree', '--name-only', `${ref}:${dir}`], {allowFailure: true});
     if (!listing) continue;
     for (const entry of listing.split('\n').filter(Boolean)) {
-      const packageDir = `${dir}/${entry.replace(/\/$/, '')}`;
-      const name = readComposerName(git, packageDir);
-      if (name) toSource.set(name, packageDir);
+      // dir '' means the repository root is the container, so each top level
+      // directory is itself a package (inventory and security-package do this).
+      const name_ = entry.replace(/\/$/, '');
+      const packageDir = dir ? `${dir}/${name_}` : name_;
+      const pkgName = readComposerName(git, packageDir);
+      if (pkgName) toSource.set(pkgName, packageDir);
     }
   }
 
-  for (const dir of individualDirsFor(definition)) {
-    const name = readComposerName(git, dir);
-    if (name) toSource.set(name, dir);
+  for (const entry of individualEntriesFor(definition)) {
+    // The base package has no composer.json in the tree; its name comes from the
+    // template the build uses, and it maps to the repository root, which is where
+    // lib/web, app/etc and the other unpackaged paths live.
+    const name = entry.dir
+      ? readComposerName(git, entry.dir)
+      : templateName(entry.composerJsonPath);
+    if (name) toSource.set(name, entry.dir);
   }
 
   return toSource;
+};
+
+const dedupeBy = (entries, keyOf) => {
+  const seen = new Set();
+  return entries.filter(entry => {
+    const key = keyOf(entry);
+    if (typeof key !== 'string' || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+};
+
+/** Whatever the checkout is currently on, so callers need not know each
+ *  repository's default branch name (some use mage-os rather than main). */
+const defaultRefOf = (repoDir) => {
+  const git = gitFor(repoDir, 'HEAD');
+  const head = git(['rev-parse', 'HEAD'], {allowFailure: true});
+  return head ? head.trim() : null;
+};
+
+const repoDirName = (repoUrl) => path.basename(repoUrl).replace(/\.git$/, '');
+
+/**
+ * A patch may touch packages from any repository the distribution is built
+ * from, not just magento2: the inventory, page builder and security package
+ * modules all live in their own repositories. Passing gitRepoDir builds the map
+ * across every repository present there, which is the layout the release build
+ * already clones into.
+ */
+const buildPackageMap = ({repoDir, ref, definitionKey = 'magento2', gitRepoDir}) => {
+  const toSource = new Map();
+
+  if (gitRepoDir) {
+    // Every directory layout any repository uses, applied to every checkout
+    // found. Probing rather than matching config keys to directory names keeps
+    // this working whichever set of repositories is cloned, and whatever they
+    // are named locally.
+    const everyLayout = {
+      packageDirs: dedupeBy(
+        Object.values(packagesConfig).flatMap(d => d.packageDirs || []),
+        entry => entry.dir
+      ),
+      packageIndividual: dedupeBy(
+        Object.values(packagesConfig).flatMap(d => d.packageIndividual || []),
+        entry => entry.dir
+      ),
+    };
+
+    for (const entry of fs.readdirSync(gitRepoDir, {withFileTypes: true})) {
+      if (!entry.isDirectory()) continue;
+      const dir = path.join(gitRepoDir, entry.name);
+      if (!fs.existsSync(path.join(dir, '.git'))) continue;
+      const head = ref || defaultRefOf(dir);
+      if (!head) continue;
+      addRepoPackages(toSource, {repoDir: dir, ref: head, definition: everyLayout});
+    }
+    return toSource;
+  }
+
+  const definition = packagesConfig[definitionKey];
+  if (!definition) {
+    throw new Error(`No package definition "${definitionKey}" in packages-config`);
+  }
+  return addRepoPackages(toSource, {repoDir, ref, definition});
 };
 
 /**
@@ -103,14 +179,23 @@ const makeTranslators = (packageMap) => {
 
   const vendorToSource = (path) => {
     const match = path.match(/^vendor\/([^/]+\/[^/]+)(\/.*)?$/);
-    if (!match) return null;
+    // Some upstream patches address root relative paths directly, e.g.
+    // lib/web/mage/menu.js or app/etc/di.xml. Those are already source tree
+    // paths, so they pass through rather than counting as a failed lookup.
+    if (!match) return path.startsWith('vendor/') ? null : path;
     const [, name, rest] = match;
-    // The source tree declares magento/*; the published packages are renamed to
-    // mage-os/* at build time, so an incoming patch may use either vendor.
-    const candidates = [name, name.replace(/^mage-os\//, 'magento/')];
+    // Adobe patches reference magento/*, the published packages are renamed to
+    // mage-os/*, and a checkout may hold either depending on whether a release
+    // build has rewritten its composer.json files. Try both directions.
+    const candidates = [
+      name,
+      name.replace(/^mage-os\//, 'magento/'),
+      name.replace(/^magento\//, 'mage-os/'),
+    ];
     for (const candidate of candidates) {
+      if (!packageMap.has(candidate)) continue;
       const dir = packageMap.get(candidate);
-      if (dir) return `${dir}${rest || ''}`;
+      return dir ? `${dir}${rest || ''}` : (rest || '').replace(/^\//, '');
     }
     return null;
   };
