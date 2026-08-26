@@ -228,3 +228,35 @@ describe('translatePatch install-only paths', () => {
     expect(text).toContain('+new');
   });
 });
+
+describe('translatePatch output framing', () => {
+  it('keeps the trailing newline when the dropped section was last', () => {
+    const patch = [
+      'diff --git a/vendor/magento/module-cms/Model/Page.php b/vendor/magento/module-cms/Model/Page.php',
+      '--- a/vendor/magento/module-cms/Model/Page.php',
+      '+++ b/vendor/magento/module-cms/Model/Page.php',
+      '@@ -1 +1 @@',
+      '-old',
+      '+new',
+      'diff --git a/vendor/bin/patch-status b/vendor/bin/patch-status',
+      '--- a/vendor/bin/patch-status',
+      '+++ b/vendor/bin/patch-status',
+      '@@ -1 +1 @@',
+      '-marker',
+      '+marker2',
+      '',
+    ].join('\n');
+
+    const {text, stats} = translatePatch(patch, packageMap, 'to-source');
+
+    expect(stats.dropped).toEqual(['vendor/bin/patch-status']);
+    // git apply reports "corrupt patch" without this.
+    expect(text.endsWith('\n')).toBe(true);
+  });
+
+  it('does not invent a trailing newline the input lacked', () => {
+    const patch = '--- a/vendor/magento/module-cms/Model/Page.php';
+
+    expect(translatePatch(patch, packageMap, 'to-source').text.endsWith('\n')).toBe(false);
+  });
+});

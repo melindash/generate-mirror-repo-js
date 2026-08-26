@@ -106,7 +106,22 @@ for (const target of targets) {
     continue;
   }
 
-  git(['apply', '--3way', patchFile], {allowFailure: true});
+  // git apply is atomic: one rejected file rolls the whole patch back. Without
+  // the stderr the result is an unexplained "nothing applied", when in practice
+  // it usually means a single hunk is already present upstream.
+  let applyOutput = '';
+  try {
+    execFileSync('git', ['-C', repoDir, 'apply', '--3way', patchFile], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (exception) {
+    applyOutput = `${exception.stdout || ''}${exception.stderr || ''}`;
+  }
+
+  const blockedFiles = [...new Set(
+    [...applyOutput.matchAll(/error: patch failed: ([^:\n]+):/g)].map(match => match[1])
+  )];
 
   const status = git(['status', '--porcelain'], {allowFailure: true}) || '';
   const conflicts = status.split('\n')
@@ -115,7 +130,13 @@ for (const target of targets) {
   const applied = status.split('\n').filter(line => /^[MA][ M] /.test(line)).length;
 
   if (applied === 0 && conflicts.length === 0) {
-    results.push({target, status: 'NO-OP', detail: 'patch produced no changes'});
+    results.push({
+      target,
+      status: blockedFiles.length ? 'REJECTED' : 'NO-OP',
+      detail: blockedFiles.length
+        ? `rolled back, blocked by: ${blockedFiles.join(' ')}`
+        : 'patch produced no changes',
+    });
     continue;
   }
 

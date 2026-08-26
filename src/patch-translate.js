@@ -243,6 +243,11 @@ const translatePatch = (patchText, packageMap, direction) => {
 
   const stats = {translated: 0, untranslated: [], dropped: []};
 
+  // git apply rejects a patch that does not end in a newline. Dropping the last
+  // section would otherwise take the trailing newline with it, and the isolated
+  // patches put their install-only marker last.
+  const endsWithNewline = patchText.endsWith('\n');
+
   // Sections are split on diff --git so a dropped file takes its hunks with it.
   const sections = [];
   for (const line of patchText.split('\n')) {
@@ -296,7 +301,8 @@ const translatePatch = (patchText, packageMap, direction) => {
 
   stats.untranslated = [...new Set(stats.untranslated)];
   stats.dropped = [...new Set(stats.dropped)];
-  return {text, stats};
+  const output = endsWithNewline && !text.endsWith('\n') ? `${text}\n` : text;
+  return {text: output, stats};
 };
 
 module.exports = {buildPackageMap, translatePatch};
