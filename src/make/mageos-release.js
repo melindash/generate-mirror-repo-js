@@ -17,7 +17,7 @@ const {fetchPackagistList} = require('../packagist');
 const buildState = require('../type/build-state');
 
 const options = parseOptions(
-  `$outputDir $gitRepoDir $repoUrl $mageosVendor $mageosRelease $upstreamRelease @skipHistory @skipAliases @help|h`,
+  `$outputDir $gitRepoDir $repoUrl $mageosVendor $mageosRelease $releaseRefsFile $upstreamRelease @skipHistory @skipAliases @help|h`,
   process.argv
 );
 
