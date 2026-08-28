@@ -20,7 +20,7 @@ const parseOptions = require('parse-options');
 const {buildPackageMap, translatePatch} = require('../src/patch-translate');
 
 const options = parseOptions(
-  `$repoDir $patch $branches $label $direction @help|h`,
+  `$repoDir $patch $branches $label $direction @partial @help|h`,
   process.argv
 );
 
@@ -36,6 +36,8 @@ Options:
   --branches=  Comma separated target branches (required), e.g. main,release/3.x
   --label=     Short name used for the created branches (default: security-patch)
   --direction= to-source (default) or none, to skip translation
+  --partial    Apply what applies and leave .rej files for the rest, instead of
+               rolling the whole patch back when one file conflicts
 
 Creates and commits one branch per target, named <label>-<branch>, and returns
 the repository to the ref it started on. Conflicts are left in the working tree
@@ -114,15 +116,24 @@ for (const target of targets) {
   // git apply is atomic: one rejected file rolls the whole patch back. Without
   // the stderr the result is an unexplained "nothing applied", when in practice
   // it usually means a single hunk is already present upstream.
+  // --3way merges using the patch's blob ids and is atomic: one rejected file
+  // rolls the whole patch back. --reject applies what it can and leaves .rej
+  // behind, which is what you want for a large patch where one hunk has drifted.
+  // git refuses the two together, so this is a mode, not a flag.
+  const applyArgs = options.partial ? ['apply', '--reject'] : ['apply', '--3way'];
+
   let applyOutput = '';
   try {
-    execFileSync('git', ['-C', repoDir, 'apply', '--3way', patchFile], {
+    execFileSync('git', ['-C', repoDir, ...applyArgs, patchFile], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
     });
   } catch (exception) {
     applyOutput = `${exception.stdout || ''}${exception.stderr || ''}`;
   }
+
+  const rejects = (git(['ls-files', '--others', '--exclude-standard'], {allowFailure: true}) || '')
+    .split('\n').filter(f => f.endsWith('.rej'));
 
   const blockedFiles = [...new Set(
     [...applyOutput.matchAll(/error: patch failed: ([^:\n]+):/g)].map(match => match[1])
@@ -145,11 +156,36 @@ for (const target of targets) {
     return Math.round((found / added.length) * 100);
   };
 
+  const tot = (translated.text.match(/^diff --git /gm) || []).length;
   const status = git(['status', '--porcelain'], {allowFailure: true}) || '';
   const conflicts = status.split('\n')
     .filter(line => /^(UU|AA|DD|AU|UA|DU|UD) /.test(line))
     .map(line => line.slice(3));
-  const applied = status.split('\n').filter(line => /^[MA][ M] /.test(line)).length;
+  // --3way stages what it applies; --reject leaves it unstaged. Count either,
+  // and never count the .rej files themselves.
+  const applied = status.split('\n')
+    .filter(line => /^([ MA][MA] |[MA][ M] |\?\? )/.test(line) && !line.endsWith('.rej'))
+    .length;
+
+  // Committed before classifying, and for partial results too: the branch exists
+  // only to hold this result, and anything left in the working tree stops the
+  // tool leaving the branch, so the next target or run cannot check out. Rejects
+  // stay uncommitted — they are working notes for whoever resolves the conflict.
+  if (applied > 0 && conflicts.length === 0) {
+    git(['add', '--all', '--', ':!*.rej'], {allowFailure: true});
+    git(['commit', '-m', `Port Adobe security patch ${label}`], {allowFailure: true});
+  }
+
+  if (rejects.length) {
+    results.push({
+      target,
+      status: 'PARTIAL',
+      detail: `${applied} of ${tot} applied, ${rejects.length} rejected: ` +
+        rejects.map(f => f.replace(/\.rej$/, '')).join(' '),
+      branch,
+    });
+    continue;
+  }
 
   if (applied === 0 && conflicts.length === 0) {
     results.push({
@@ -174,11 +210,6 @@ for (const target of targets) {
     });
     continue;
   }
-
-  // Always committed: the branch exists only to hold this result, and leaving it
-  // staged means the tool cannot leave the branch, so a second target or a
-  // second run cannot check anything out.
-  git(['commit', '-m', `Port Adobe security patch ${label}`], {allowFailure: true});
 
   results.push({target, status: 'CLEAN', detail: `${applied} files applied`, branch});
 }
