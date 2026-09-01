@@ -46,9 +46,17 @@ branch with the markers in place, because that is the material a reviewer needs
 and because anything left in the working tree blocks the next checkout. Rejected
 hunks stay as untracked .rej files next to the file they belong to.
 
-Exits non-zero if any target needs a person: ERROR, UNMAPPED, CONFLICT or
-PARTIAL.
+Exits non-zero if any target needs a person: ERROR, UNMAPPED, REJECTED,
+CONFLICT or PARTIAL.
 `);
+  process.exit(1);
+}
+
+// Validated here because translatePatch's own check is never reached with the
+// user's value: anything but "none" used to fall through to to-source silently.
+const direction = options.direction || 'to-source';
+if (direction !== 'to-source' && direction !== 'none') {
+  console.error(`Unknown --direction "${direction}", expected to-source or none`);
   process.exit(1);
 }
 
@@ -103,7 +111,7 @@ for (const target of targets) {
   // lines, so a map built from one branch may not describe another.
   let translated;
   try {
-    if (options.direction === 'none') {
+    if (direction === 'none') {
       translated = {text: patchText, stats: {translated: 0, untranslated: []}};
     } else {
       // Only needed when translating, and it costs a git read per package.
@@ -157,12 +165,14 @@ for (const target of targets) {
   const rejectsBefore = new Set(listRejects());
 
   let applyOutput = '';
+  let applyFailed = false;
   try {
     execFileSync('git', ['-C', repoDir, ...applyArgs, patchFile], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'pipe'],
     });
   } catch (exception) {
+    applyFailed = true;
     applyOutput = `${exception.stdout || ''}${exception.stderr || ''}`;
   }
 
@@ -184,6 +194,19 @@ for (const target of targets) {
     if (openSection) openSection.push(line);
   }
 
+  // The file set the applied count is checked against. A plain diff -u has no
+  // diff --git headers, so fall back to the +++/--- markers; a body line that
+  // happens to start with them can only add a name no porcelain entry matches.
+  const patchFiles = new Set(sectionsByFile.keys());
+  if (patchFiles.size === 0) {
+    for (const line of translated.text.split('\n')) {
+      const marker = line.match(/^(?:---|\+\+\+) (\S+)/);
+      if (marker && marker[1] !== '/dev/null') {
+        patchFiles.add(marker[1].replace(/^[ab]\//, ''));
+      }
+    }
+  }
+
   // A file can fail to apply because the fix is already present by another
   // route, which looks identical to a real conflict in git's output. Comparing
   // that file's own added lines against the file on disk distinguishes the two
@@ -202,18 +225,22 @@ for (const target of targets) {
     return Math.round((found / added.length) * 100);
   };
 
-  const tot = sectionsByFile.size;
+  const tot = patchFiles.size;
+  const CONFLICT_CODES = /^(UU|AA|DD|AU|UA|DU|UD) /;
   const status = git(['status', '--porcelain'], {allowFailure: true}) || '';
   const conflicts = status.split('\n')
-    .filter(line => /^(UU|AA|DD|AU|UA|DU|UD) /.test(line))
+    .filter(line => CONFLICT_CODES.test(line))
     .map(line => line.slice(3));
-  // --3way stages what it applies; --reject leaves it unstaged. Count either,
-  // never the .rej files, and only files the patch actually names, so unrelated
-  // working tree noise cannot inflate the number.
+  // --3way stages what it applies; --reject leaves it unstaged. Count whatever
+  // the patch names that changed under any code — deletions and renames
+  // included, which an allowlist of M/A used to drop — never the .rej files,
+  // and nothing the patch does not name, so unrelated working tree noise
+  // cannot inflate the number. A rename line reads "old -> new"; the b side is
+  // the one the patch names.
   const applied = status.split('\n')
-    .filter(line => /^([ MA][MA] |[MA][ M] |\?\? )/.test(line) && !line.endsWith('.rej'))
-    .map(line => line.slice(3))
-    .filter(file => sectionsByFile.size === 0 || sectionsByFile.has(file))
+    .filter(line => line.trim() && !CONFLICT_CODES.test(line) && !line.endsWith('.rej'))
+    .map(line => line.slice(3).split(' -> ').pop())
+    .filter(file => patchFiles.has(file))
     .length;
 
   // Committed before classifying, and for conflicted and partial results too.
@@ -242,16 +269,38 @@ for (const target of targets) {
   }
 
   if (applied === 0 && conflicts.length === 0) {
-    results.push({
-      target,
-      status: blockedFiles.length ? 'REJECTED' : 'NO-OP',
-      detail: blockedFiles.length
-        ? `rolled back, blocked by: ${blockedFiles.map(file => {
-            const pct = alreadyPresent(file);
-            return pct === null ? file : `${file} (${pct}% of added lines already present)`;
-          }).join(' ')}`
-        : 'patch produced no changes',
-    });
+    // Nothing was committed, so the branch is an empty duplicate of its
+    // target. Leaving it around would make the next run demand --force for a
+    // branch holding no result.
+    git(['checkout', '--detach'], {allowFailure: true});
+    git(['branch', '-D', branch], {allowFailure: true});
+
+    if (blockedFiles.length) {
+      results.push({
+        target,
+        status: 'REJECTED',
+        detail: `rolled back, blocked by: ${blockedFiles.map(file => {
+          const pct = alreadyPresent(file);
+          return pct === null ? file : `${file} (${pct}% of added lines already present)`;
+        }).join(' ')}`,
+      });
+      continue;
+    }
+
+    // git apply can fail without a "patch failed" line — a corrupt patch, or a
+    // delete/rename of a file absent on this branch. That used to read as
+    // NO-OP, which looks like an already-applied patch and exits 0.
+    if (applyFailed) {
+      const lines = applyOutput.split('\n').map(line => line.trim()).filter(Boolean);
+      results.push({
+        target,
+        status: 'ERROR',
+        detail: lines.find(line => line.startsWith('error:')) || lines[0] || 'git apply failed',
+      });
+      continue;
+    }
+
+    results.push({target, status: 'NO-OP', detail: 'patch produced no changes'});
     continue;
   }
 
@@ -309,5 +358,5 @@ if (conflicted.length) {
   console.log(`${conflicted.length} branch(es) carry conflict markers and need resolving.`);
 }
 
-const needsAPerson = ['ERROR', 'UNMAPPED', 'CONFLICT', 'PARTIAL'];
+const needsAPerson = ['ERROR', 'UNMAPPED', 'REJECTED', 'CONFLICT', 'PARTIAL'];
 process.exit(results.some(r => needsAPerson.includes(r.status)) ? 1 : 0);
