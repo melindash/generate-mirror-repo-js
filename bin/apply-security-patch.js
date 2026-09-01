@@ -20,7 +20,7 @@ const parseOptions = require('parse-options');
 const {buildPackageMap, translatePatch} = require('../src/patch-translate');
 
 const options = parseOptions(
-  `$repoDir $patch $branches $label $direction @partial @help|h`,
+  `$repoDir $patch $branches $label $direction @partial @force @help|h`,
   process.argv
 );
 
@@ -38,10 +38,16 @@ Options:
   --direction= to-source (default) or none, to skip translation
   --partial    Apply what applies and leave .rej files for the rest, instead of
                rolling the whole patch back when one file conflicts
+  --force      Replace an existing <label>-<branch>, discarding what is on it
 
 Creates and commits one branch per target, named <label>-<branch>, and returns
-the repository to the ref it started on. Conflicts are left in the working tree
-for resolution and reported in the summary.
+the repository to the ref it started on. A conflicted result is committed to its
+branch with the markers in place, because that is the material a reviewer needs
+and because anything left in the working tree blocks the next checkout. Rejected
+hunks stay as untracked .rej files next to the file they belong to.
+
+Exits non-zero if any target needs a person: ERROR, UNMAPPED, CONFLICT or
+PARTIAL.
 `);
   process.exit(1);
 }
@@ -69,6 +75,21 @@ const patchText = options.patch === '-'
 
 const branchName = (target) => `${label}-${target.replace(/[^A-Za-z0-9._-]/g, '-')}`;
 
+const listRejects = () => (git(['ls-files', '--others', '--exclude-standard'], {allowFailure: true}) || '')
+  .split('\n').filter(file => file.endsWith('.rej'));
+
+// Untracked .rej files are this tool's own output from an earlier run, and a
+// reviewer is meant to still have them, so they do not count as a dirty tree.
+const trackedChanges = (git(['status', '--porcelain'], {allowFailure: true}) || '')
+  .split('\n').filter(Boolean).filter(line => !line.endsWith('.rej'));
+
+if (trackedChanges.length) {
+  console.error(`${repoDir} has uncommitted changes. Applying a patch on top of them would`);
+  console.error('mix them into the result branches. Commit or stash them first:');
+  trackedChanges.forEach(line => console.error(`  ${line}`));
+  process.exit(1);
+}
+
 const results = [];
 const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'mageos-patch-'));
 
@@ -82,12 +103,13 @@ for (const target of targets) {
   // lines, so a map built from one branch may not describe another.
   let translated;
   try {
-    const packageMap = buildPackageMap({repoDir, ref: target});
-    if (packageMap.size === 0) throw new Error(`no packages found at ${target}`);
-
     if (options.direction === 'none') {
       translated = {text: patchText, stats: {translated: 0, untranslated: []}};
     } else {
+      // Only needed when translating, and it costs a git read per package.
+      const packageMap = buildPackageMap({repoDir, ref: target});
+      if (packageMap.size === 0) throw new Error(`no packages found at ${target}`);
+
       translated = translatePatch(patchText, packageMap, 'to-source');
       if (translated.stats.untranslated.length) {
         results.push({
@@ -107,7 +129,15 @@ for (const target of targets) {
   fs.writeFileSync(patchFile, translated.text);
 
   const branch = branchName(target);
-  git(['branch', '-D', branch], {allowFailure: true});
+  const exists = git(['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`], {allowFailure: true});
+  // A previous run's branch can hold a resolved conflict. Replacing it silently
+  // would throw that away, so it takes saying so.
+  if (exists && !options.force) {
+    results.push({target, status: 'ERROR', detail: `branch ${branch} already exists, --force to replace`});
+    continue;
+  }
+  if (exists) git(['branch', '-D', branch], {allowFailure: true});
+
   if (git(['checkout', '-b', branch, target], {allowFailure: true}) === null) {
     results.push({target, status: 'ERROR', detail: `cannot check out ${target}`});
     continue;
@@ -122,6 +152,10 @@ for (const target of targets) {
   // git refuses the two together, so this is a mode, not a flag.
   const applyArgs = options.partial ? ['apply', '--reject'] : ['apply', '--3way'];
 
+  // Rejects from an earlier target are still untracked here, so only the ones
+  // this apply produces are attributed to this target.
+  const rejectsBefore = new Set(listRejects());
+
   let applyOutput = '';
   try {
     execFileSync('git', ['-C', repoDir, ...applyArgs, patchFile], {
@@ -132,22 +166,34 @@ for (const target of targets) {
     applyOutput = `${exception.stdout || ''}${exception.stderr || ''}`;
   }
 
-  const rejects = (git(['ls-files', '--others', '--exclude-standard'], {allowFailure: true}) || '')
-    .split('\n').filter(f => f.endsWith('.rej'));
+  const rejects = listRejects().filter(file => !rejectsBefore.has(file));
 
   const blockedFiles = [...new Set(
     [...applyOutput.matchAll(/error: patch failed: ([^:\n]+):/g)].map(match => match[1])
   )];
 
+  // Keyed by the b side path, which is the form git reports in "patch failed".
+  const sectionsByFile = new Map();
+  let openSection = null;
+  for (const line of translated.text.split('\n')) {
+    const header = line.match(/^diff --git (\S+) (\S+)/);
+    if (header) {
+      openSection = [];
+      sectionsByFile.set(header[2].replace(/^[ab]\//, ''), openSection);
+    }
+    if (openSection) openSection.push(line);
+  }
+
   // A file can fail to apply because the fix is already present by another
   // route, which looks identical to a real conflict in git's output. Comparing
-  // the patch's added lines against the file on disk distinguishes the two well
-  // enough to tell a reviewer where to look. It is a signal, not a proof.
+  // that file's own added lines against the file on disk distinguishes the two
+  // well enough to tell a reviewer where to look. It is a signal, not a proof.
   const alreadyPresent = (file) => {
     const target = path.join(repoDir, file);
-    if (!fs.existsSync(target)) return null;
+    const section = sectionsByFile.get(file);
+    if (!section || !fs.existsSync(target)) return null;
     const contents = fs.readFileSync(target, 'utf8');
-    const added = translated.text.split('\n')
+    const added = section
       .filter(line => line.startsWith('+') && !line.startsWith('+++'))
       .map(line => line.slice(1).trim())
       .filter(line => line.length > 12);
@@ -156,24 +202,32 @@ for (const target of targets) {
     return Math.round((found / added.length) * 100);
   };
 
-  const tot = (translated.text.match(/^diff --git /gm) || []).length;
+  const tot = sectionsByFile.size;
   const status = git(['status', '--porcelain'], {allowFailure: true}) || '';
   const conflicts = status.split('\n')
     .filter(line => /^(UU|AA|DD|AU|UA|DU|UD) /.test(line))
     .map(line => line.slice(3));
   // --3way stages what it applies; --reject leaves it unstaged. Count either,
-  // and never count the .rej files themselves.
+  // never the .rej files, and only files the patch actually names, so unrelated
+  // working tree noise cannot inflate the number.
   const applied = status.split('\n')
     .filter(line => /^([ MA][MA] |[MA][ M] |\?\? )/.test(line) && !line.endsWith('.rej'))
+    .map(line => line.slice(3))
+    .filter(file => sectionsByFile.size === 0 || sectionsByFile.has(file))
     .length;
 
-  // Committed before classifying, and for partial results too: the branch exists
-  // only to hold this result, and anything left in the working tree stops the
-  // tool leaving the branch, so the next target or run cannot check out. Rejects
-  // stay uncommitted — they are working notes for whoever resolves the conflict.
-  if (applied > 0 && conflicts.length === 0) {
+  // Committed before classifying, and for conflicted and partial results too.
+  // Anything left in the working tree blocks the next target's checkout, which
+  // used to make one conflict fail every target after it. Conflict markers are
+  // worth committing: the branch exists only to hold this result, and the
+  // markers are what a reviewer resolves. Rejects stay uncommitted, as working
+  // notes next to the file they belong to.
+  if (applied > 0 || conflicts.length) {
     git(['add', '--all', '--', ':!*.rej'], {allowFailure: true});
-    git(['commit', '-m', `Port Adobe security patch ${label}`], {allowFailure: true});
+    const subject = conflicts.length
+      ? `Port Adobe security patch ${label} (unresolved conflicts)`
+      : `Port Adobe security patch ${label}`;
+    git(['commit', '-m', subject], {allowFailure: true});
   }
 
   if (rejects.length) {
@@ -217,9 +271,12 @@ for (const target of targets) {
 fs.rmSync(scratch, {recursive: true, force: true});
 
 if (startingRef) {
-  // Staged results live on their own branches, so returning to the starting ref
-  // does not discard anything.
-  git(['checkout', startingRef], {allowFailure: true});
+  // Every result is committed to its own branch, so returning to the starting
+  // ref does not discard anything.
+  if (git(['checkout', startingRef], {allowFailure: true}) === null) {
+    const now = (git(['rev-parse', '--abbrev-ref', 'HEAD'], {allowFailure: true}) || '?').trim();
+    console.error(`Warning: could not return to ${startingRef}; the checkout is left on ${now}`);
+  }
 }
 
 const widthOf = (key, heading) =>
@@ -247,9 +304,10 @@ for (const result of results) {
 }
 console.log('');
 
-const failed = results.filter(r => r.status === 'ERROR' || r.status === 'UNMAPPED');
 const conflicted = results.filter(r => r.status === 'CONFLICT');
 if (conflicted.length) {
-  console.log(`${conflicted.length} branch(es) need conflict resolution before review.`);
+  console.log(`${conflicted.length} branch(es) carry conflict markers and need resolving.`);
 }
-process.exit(failed.length ? 1 : 0);
+
+const needsAPerson = ['ERROR', 'UNMAPPED', 'CONFLICT', 'PARTIAL'];
+process.exit(results.some(r => needsAPerson.includes(r.status)) ? 1 : 0);
