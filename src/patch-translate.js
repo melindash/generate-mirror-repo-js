@@ -171,6 +171,10 @@ const makeTranslators = (packageMap) => {
 
   const sourceToVendor = (path) => {
     for (const [name, dir] of byDepth) {
+      // Sorted longest first, so the base package's empty dir is reached last
+      // and acts as the fallback for the unpackaged paths it owns (lib/web,
+      // app/etc) rather than never matching at all.
+      if (dir === '') return `vendor/${name}/${path}`;
       if (path === dir) return `vendor/${name}`;
       if (path.startsWith(`${dir}/`)) return `vendor/${name}${path.slice(dir.length)}`;
     }
@@ -212,10 +216,17 @@ const makeTranslators = (packageMap) => {
  */
 const INSTALL_ONLY = [/^vendor\/bin\//];
 
-const isInstallOnly = (path) => INSTALL_ONLY.some(pattern => pattern.test(path.replace(/^[ab]\//, '')));
+const bare = (path) => path.replace(/^[ab]\//, '');
+
+const isInstallOnly = (path) => path !== '/dev/null'
+  && INSTALL_ONLY.some(pattern => pattern.test(bare(path)));
 
 // Matches the path-bearing lines of a unified diff. Trailing text after the
 // path (timestamps, tabs) is preserved verbatim.
+//
+// These shapes are only meaningful in a header position. A removed line whose
+// own content begins "-- " arrives as "--- ...", which no regex can tell from a
+// file marker; only position separates them, so the walk below tracks it.
 const DIFF_GIT = /^(diff --git )(\S+)( )(\S+)(.*)$/;
 const FILE_MARKER = /^(---|\+\+\+)(\s+)(\S+)(.*)$/;
 const RENAME = /^(rename (?:from|to) )(.+)$/;
@@ -234,12 +245,65 @@ const withPrefix = (path, translate) => {
   return translated === null ? null : prefix + translated;
 };
 
+const HUNK_HEADER = /^@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@/;
+
+/**
+ * Applies rewrite to the path-bearing header lines only, skipping hunk bodies.
+ *
+ * Hunk extent comes from the @@ line counts rather than from the next header:
+ * a plain diff -u has no per-file header to stop at, and the corpus contains
+ * both framings.
+ */
+const rewriteHeaderPaths = (lines, rewrite) => {
+  let oldRemaining = 0;
+  let newRemaining = 0;
+
+  return lines.map(line => {
+    if (oldRemaining > 0 || newRemaining > 0) {
+      if (line.startsWith('\\')) return line; // "\ No newline at end of file"
+      if (line.startsWith('-')) oldRemaining = Math.max(0, oldRemaining - 1);
+      else if (line.startsWith('+')) newRemaining = Math.max(0, newRemaining - 1);
+      else {
+        oldRemaining = Math.max(0, oldRemaining - 1);
+        newRemaining = Math.max(0, newRemaining - 1);
+      }
+      return line;
+    }
+
+    const hunk = line.match(HUNK_HEADER);
+    if (hunk) {
+      // An omitted count means one line, per the unified diff format.
+      oldRemaining = hunk[1] === undefined ? 1 : parseInt(hunk[1], 10);
+      newRemaining = hunk[2] === undefined ? 1 : parseInt(hunk[2], 10);
+      return line;
+    }
+
+    let match = line.match(DIFF_GIT);
+    if (match) {
+      return match[1] + rewrite(match[2]) + match[3] + rewrite(match[4]) + match[5];
+    }
+    match = line.match(BINARY);
+    if (match) {
+      return match[1] + rewrite(match[2]) + match[3] + rewrite(match[4]) + match[5];
+    }
+    match = line.match(FILE_MARKER);
+    if (match) {
+      return match[1] + match[2] + rewrite(match[3]) + match[4];
+    }
+    match = line.match(RENAME);
+    if (match) {
+      return match[1] + rewrite(match[2]);
+    }
+    return line;
+  });
+};
+
 const translatePatch = (patchText, packageMap, direction) => {
-  const {sourceToVendor, vendorToSource} = makeTranslators(packageMap);
-  const translate = direction === 'to-vendor' ? sourceToVendor : vendorToSource;
   if (direction !== 'to-vendor' && direction !== 'to-source') {
     throw new Error(`Unknown direction "${direction}", expected to-vendor or to-source`);
   }
+  const {sourceToVendor, vendorToSource} = makeTranslators(packageMap);
+  const translate = direction === 'to-vendor' ? sourceToVendor : vendorToSource;
 
   const stats = {translated: 0, untranslated: [], dropped: []};
 
@@ -258,9 +322,11 @@ const translatePatch = (patchText, packageMap, direction) => {
   const kept = sections.filter(section => {
     const header = section[0].match(DIFF_GIT);
     if (!header) return true;
-    const target = header[4];
-    if (direction === 'to-source' && isInstallOnly(target)) {
-      stats.dropped.push(target.replace(/^[ab]\//, ''));
+    // Either side, because a deletion can carry the real path on only one of
+    // them depending on which tool wrote the diff.
+    const target = [header[4], header[2]].find(isInstallOnly);
+    if (direction === 'to-source' && target) {
+      stats.dropped.push(bare(target));
       return false;
     }
     return true;
@@ -272,32 +338,18 @@ const translatePatch = (patchText, packageMap, direction) => {
     if (path === '/dev/null') return path;
     const out = withPrefix(path, translate);
     if (out === null) {
-      stats.untranslated.push(path.replace(/^[ab]\//, ''));
+      // A section whose header named an install-only path is already gone. This
+      // catches the same path in a diff -u run that has no header to drop.
+      if (!(direction === 'to-source' && isInstallOnly(path))) {
+        stats.untranslated.push(bare(path));
+      }
       return path;
     }
     stats.translated++;
     return out;
   };
 
-  const text = patchText.split('\n').map(line => {
-    let match = line.match(DIFF_GIT);
-    if (match) {
-      return match[1] + rewrite(match[2]) + match[3] + rewrite(match[4]) + match[5];
-    }
-    match = line.match(BINARY);
-    if (match) {
-      return match[1] + rewrite(match[2]) + match[3] + rewrite(match[4]) + match[5];
-    }
-    match = line.match(FILE_MARKER);
-    if (match) {
-      return match[1] + match[2] + rewrite(match[3]) + match[4];
-    }
-    match = line.match(RENAME);
-    if (match) {
-      return match[1] + rewrite(match[2]);
-    }
-    return line;
-  }).join('\n');
+  const text = rewriteHeaderPaths(patchText.split('\n'), rewrite).join('\n');
 
   stats.untranslated = [...new Set(stats.untranslated)];
   stats.dropped = [...new Set(stats.dropped)];

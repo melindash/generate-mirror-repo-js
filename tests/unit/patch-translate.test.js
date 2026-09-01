@@ -260,3 +260,103 @@ describe('translatePatch output framing', () => {
     expect(translatePatch(patch, packageMap, 'to-source').text.endsWith('\n')).toBe(false);
   });
 });
+
+describe('translatePatch hunk bodies', () => {
+  const withBase = new Map([...packageMap, ['magento/magento2-base', '']]);
+
+  it('leaves a removed line alone when its own content starts with two dashes', () => {
+    // The file's line is the SQL comment "-- vendor/...", so its removed form in
+    // the diff is "--- vendor/...", which has the exact shape of a file marker.
+    const patch = [
+      'diff --git a/vendor/magento/module-cms/setup.sql b/vendor/magento/module-cms/setup.sql',
+      '--- a/vendor/magento/module-cms/setup.sql',
+      '+++ b/vendor/magento/module-cms/setup.sql',
+      '@@ -1,2 +1,2 @@',
+      '--- vendor/magento/module-cms/legacy.sql',
+      '+++ vendor/magento/module-cms/legacy2.sql',
+    ].join('\n');
+
+    const {text, stats} = toSource(patch);
+    const body = text.split('\n').slice(4);
+
+    expect(body).toEqual([
+      '--- vendor/magento/module-cms/legacy.sql',
+      '+++ vendor/magento/module-cms/legacy2.sql',
+    ]);
+    // Four header paths, and nothing from the body.
+    expect(stats.translated).toBe(4);
+  });
+
+  it('resumes rewriting once a hunk has run its declared length', () => {
+    const patch = [
+      '--- a/vendor/magento/module-cms/A.php',
+      '+++ b/vendor/magento/module-cms/A.php',
+      '@@ -1,1 +1,1 @@',
+      '-one',
+      '+two',
+      '--- a/vendor/magento/framework/B.php',
+      '+++ b/vendor/magento/framework/B.php',
+    ].join('\n');
+
+    const {text} = toSource(patch);
+
+    expect(text).toContain('--- a/lib/internal/Magento/Framework/B.php');
+    expect(text).toContain('+++ b/lib/internal/Magento/Framework/B.php');
+  });
+
+  it('treats an omitted hunk count as one line', () => {
+    const patch = [
+      '--- a/vendor/magento/module-cms/A.php',
+      '+++ b/vendor/magento/module-cms/A.php',
+      '@@ -1 +1 @@',
+      '-old',
+      '+new',
+      '--- a/vendor/magento/framework/B.php',
+    ].join('\n');
+
+    expect(toSource(patch).text).toContain('--- a/lib/internal/Magento/Framework/B.php');
+  });
+
+  it('does not let a no-newline marker consume a hunk line', () => {
+    const patch = [
+      '--- a/vendor/magento/module-cms/A.php',
+      '+++ b/vendor/magento/module-cms/A.php',
+      '@@ -1,1 +1,1 @@',
+      '-old',
+      '\\ No newline at end of file',
+      '+new',
+      '--- a/vendor/magento/framework/B.php',
+    ].join('\n');
+
+    expect(toSource(patch).text).toContain('--- a/lib/internal/Magento/Framework/B.php');
+  });
+
+  it('drops an install-only section when only the a side carries the path', () => {
+    const patch = [
+      'diff --git a/vendor/bin/magento-patches b/dev/null',
+      'deleted file mode 100644',
+      '--- a/vendor/bin/magento-patches',
+      '+++ /dev/null',
+    ].join('\n');
+
+    const {stats} = translatePatch(patch, packageMap, 'to-source');
+
+    expect(stats.dropped).toEqual(['vendor/bin/magento-patches']);
+    expect(stats.untranslated).toEqual([]);
+  });
+
+  it('does not report an install-only path as unmapped when there is no header to drop', () => {
+    const patch = '--- a/vendor/bin/magento-patches';
+
+    expect(translatePatch(patch, packageMap, 'to-source').stats.untranslated).toEqual([]);
+  });
+
+  it('maps base package paths in the to-vendor direction', () => {
+    const patch = '--- a/lib/web/mage/menu.js';
+
+    const {text, stats} = translatePatch(patch, withBase, 'to-vendor');
+
+    expect(text).toBe('--- a/vendor/magento/magento2-base/lib/web/mage/menu.js');
+    expect(stats.untranslated).toEqual([]);
+  });
+});
