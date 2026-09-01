@@ -12,7 +12,12 @@ const fs = require('fs');
 const path = require('path');
 const {execFileSync} = require('child_process');
 const packagesConfig = require('./build-config/packages-config');
-const {buildConfig: releaseInstructions} = require('./build-config/mageos-release-build-config');
+// Required for its load-time side effect: mageos-release-build-config mutates
+// the shared packages-config object in place, which is what renames the base
+// package template to mage-os/magento2-base. Without this require the map
+// would name magento/magento2-base and to-vendor output would carry the wrong
+// namespace, and no test would fail.
+require('./build-config/mageos-release-build-config');
 
 /**
  * Directories whose immediate subdirectories are each their own package, as
@@ -138,7 +143,11 @@ const buildPackageMap = ({repoDir, ref, definitionKey = 'magento2', gitRepoDir})
       ),
       packageIndividual: dedupeBy(
         Object.values(packagesConfig).flatMap(d => d.packageIndividual || []),
-        entry => entry.dir
+        // dir alone is not unique here: dozens of base-package entries share
+        // dir '' and differ only in which composer template names them.
+        entry => typeof entry.dir === 'string'
+          ? `${entry.dir} ${entry.composerJsonPath || ''}`
+          : undefined
       ),
     };
 
@@ -234,7 +243,7 @@ const isInstallOnly = (path) => path !== '/dev/null'
 // file marker; only position separates them, so the walk below tracks it.
 const DIFF_GIT = /^(diff --git )(\S+)( )(\S+)(.*)$/;
 const FILE_MARKER = /^(---|\+\+\+)(\s+)(\S+)(.*)$/;
-const RENAME = /^(rename (?:from|to) )(.+)$/;
+const RENAME_OR_COPY = /^((?:rename|copy) (?:from|to) )(.+)$/;
 const BINARY = /^(Binary files )(\S+)( and )(\S+)( differ)$/;
 
 /**
@@ -295,7 +304,7 @@ const rewriteHeaderPaths = (lines, rewrite) => {
     if (match) {
       return match[1] + match[2] + rewrite(match[3]) + match[4];
     }
-    match = line.match(RENAME);
+    match = line.match(RENAME_OR_COPY);
     if (match) {
       return match[1] + rewrite(match[2]);
     }
@@ -341,6 +350,14 @@ const translatePatch = (patchText, packageMap, direction) => {
 
   const rewrite = (path) => {
     if (path === '/dev/null') return path;
+    // Git C-quotes a path containing spaces or specials, and the header
+    // regexes split on whitespace, so what arrives here is a mangled fragment.
+    // Refusing to translate keeps the line byte-identical and reports the
+    // fragment as untranslated, instead of silently emitting a corrupt path.
+    if (path.includes('"')) {
+      stats.untranslated.push(bare(path));
+      return path;
+    }
     const out = withPrefix(path, translate);
     if (out === null) {
       // A section whose header named an install-only path is already gone. This

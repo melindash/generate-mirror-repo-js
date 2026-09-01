@@ -360,3 +360,35 @@ describe('translatePatch hunk bodies', () => {
     expect(stats.untranslated).toEqual([]);
   });
 });
+
+describe('translatePatch copy headers', () => {
+  it('rewrites copy from/to headers the way it rewrites renames', () => {
+    const patch = [
+      'copy from vendor/magento/module-cms/Model/Old.php',
+      'copy to vendor/magento/module-cms/Model/New.php',
+    ].join('\n');
+
+    expect(toSource(patch).text).toBe([
+      'copy from app/code/Magento/Cms/Model/Old.php',
+      'copy to app/code/Magento/Cms/Model/New.php',
+    ].join('\n'));
+  });
+});
+
+describe('translatePatch git-quoted paths', () => {
+  // Git C-quotes paths containing spaces. The header regexes split on
+  // whitespace and cannot reassemble the quoted form, so the contract is to
+  // leave the line byte-identical and report it, never to emit fragments.
+  it('leaves a quoted header untouched and reports it untranslated', () => {
+    const patch = [
+      'diff --git "a/vendor/magento/module-cms/x y.php" "b/vendor/magento/module-cms/x y.php"',
+      '--- "a/vendor/magento/module-cms/x y.php"',
+      '+++ "b/vendor/magento/module-cms/x y.php"',
+    ].join('\n');
+
+    const {text, stats} = toSource(patch);
+
+    expect(text).toBe(patch);
+    expect(stats.untranslated.length).toBeGreaterThan(0);
+  });
+});
