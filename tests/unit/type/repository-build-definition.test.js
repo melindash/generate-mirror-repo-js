@@ -24,6 +24,11 @@ describe('repositoryBuildDefinition', () => {
         expect(def.ref).toBeNull();
       });
 
+      it('should use null for key when not provided', () => {
+        const def = new repositoryBuildDefinition({});
+        expect(def.key).toBeNull();
+      });
+
       it('should use null for fromTag when not provided', () => {
         const def = new repositoryBuildDefinition({});
         expect(def.fromTag).toBeNull();
@@ -61,6 +66,11 @@ describe('repositoryBuildDefinition', () => {
       it('should use provided ref', () => {
         const def = new repositoryBuildDefinition({ ref: '2.4-develop' });
         expect(def.ref).toBe('2.4-develop');
+      });
+
+      it('should use provided key', () => {
+        const def = new repositoryBuildDefinition({ key: 'magento2' });
+        expect(def.key).toBe('magento2');
       });
 
       it('should use provided fromTag', () => {

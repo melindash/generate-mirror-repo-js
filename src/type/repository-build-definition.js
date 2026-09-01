@@ -10,6 +10,12 @@ const metapackageDefinition = require('./metapackage-definition');
  */
 class repositoryBuildDefinition {
   /**
+   * @type String|null Identifier of this repository in the build config, used to
+   *  target it individually from a release refs file
+   */
+  key = null;
+
+  /**
    * @type String|null Git Repository URL
    */
   repoUrl = null;
@@ -79,9 +85,10 @@ class repositoryBuildDefinition {
   extraRefToRelease = [];
 
   /**
-   * @param {{repoUrl: String, packageDirs: Array, packageIndividual: Array, packageMetaFromDirs: Array, vendor: String, ref: String, fromTag: String, skipTags: {Object}, transform: Object.<String,Array>, fixVersions: {Object}, packageReplacements: {Object}, extraRefToRelease: Array, extraMetapackages: Array}}
+   * @param {{key: String, repoUrl: String, packageDirs: Array, packageIndividual: Array, packageMetaFromDirs: Array, vendor: String, ref: String, fromTag: String, skipTags: {Object}, transform: Object.<String,Array>, fixVersions: {Object}, packageReplacements: {Object}, extraRefToRelease: Array, extraMetapackages: Array}}
    */
   constructor(options) {
+    this.key = options.key || this.key;
     this.repoUrl = options.repoUrl || this.repoUrl;
 
     this.vendor = options.vendor || this.vendor;
