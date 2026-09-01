@@ -157,6 +157,11 @@ const buildPackageMap = ({repoDir, ref, definitionKey = 'magento2', gitRepoDir})
   if (!definition) {
     throw new Error(`No package definition "${definitionKey}" in packages-config`);
   }
+  // Every read below tolerates failure, so a ref that does not exist would
+  // otherwise surface as an empty map and a patch that translates nothing.
+  if (!gitFor(repoDir, ref)(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], {allowFailure: true})) {
+    throw new Error(`ref "${ref}" not found in ${repoDir}`);
+  }
   return addRepoPackages(toSource, {repoDir, ref, definition});
 };
 
