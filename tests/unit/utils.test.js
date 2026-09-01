@@ -496,8 +496,8 @@ describe('mergeBuildConfigs', () => {
       const b = { 'my-repo': { repoUrl: 'https://example.com' } };
       const result = mergeBuildConfigs(a, b);
 
-      // The key is added to the repositoryBuildDefinition - verify via the object
       expect(result).toHaveLength(1);
+      expect(result[0].key).toBe('my-repo');
     });
 
     it('should override values from a with values from b', () => {
