@@ -112,6 +112,16 @@ jobs:
       - run: cd satis && node ../bin/set-satis-output-url-prefix.js --satisOutputDir=../build --repoUrl="${{ env.repo }}" && cd -
         name: "Fix path to packages in the packages.json satis created"
 
+      - uses: actions/upload-artifact@v4
+        name: "Upload the release metapackages for inspection"
+        with:
+          name: release-metapackages
+          path: |
+            build/packages/mage-os/product-community-edition-*.zip
+            build/packages/mage-os/project-community-edition-*.zip
+            build/packages/mage-os/magento2-base-*.zip
+          if-no-files-found: error
+
       - uses: easingthemes/ssh-deploy@v4
         name: "Rsync over SSH"
         env:
