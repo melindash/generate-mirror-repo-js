@@ -18,7 +18,7 @@ const {mergeBuildConfigs} = require('../utils');
 
 const releaseBuildConfig = {
   'magento2': {
-    repoUrl: 'https://github.com/mage-os/mageos-magento2.git',
+    repoUrl: 'https://github.com/melindash/mageos-magento2.git',
     ref: 'main',
     fromTag: '1.0.0',
     packageIndividual: [
