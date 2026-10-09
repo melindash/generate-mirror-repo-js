@@ -97,7 +97,7 @@ jobs:
       - run: npm ci
       - run: |
           node ${{ env.entrypoint }} --outputDir=build/packages --gitRepoDir=generate-repo/repositories --repoUrl="${{ env.repo }}" \
-            ${{ env.mageos_release_arg }} ${{ env.upstream_release_arg }} ${{ env.release_refs_file_arg }}
+            ${{ env.mageos_release_arg }} ${{ env.upstream_release_arg }} ${{ env.release_refs_file_arg }} ${{ inputs.entrypoint == 'src/make/mageos-release.js' && '--skipHistory' || '' }}
         name: "Generate the packages for the composer repo"
       - run: node bin/set-satis-homepage-url.js --satisConfig=satis.json --repoUrl="${{ env.repo }}" > /tmp/satis.json
         name: "Configure satis repository URL so composer knows where to download packages from"
