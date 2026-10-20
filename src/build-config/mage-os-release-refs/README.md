@@ -28,6 +28,24 @@ This exists so a release can be built from a line other than the default
 branch — for example a patch release on the previous major while `main` has
 already moved on.
 
+## Generating the file
+
+```bash
+GITHUB_TOKEN=$(gh auth token) node bin/make-release-refs.js --line=2 --dryRun
+node bin/make-release-refs.js --line=2      # writes <version>.js here
+```
+
+| Field | Derived from |
+|---|---|
+| version | The line's last tag, patch + 1 (override with `--version=`) |
+| `'*'` | That last tag. Its history file must exist |
+| branch entries | Each repository whose `release/<major>.x` has commits past the tag's source commit (the tag's parent; the tag sits on the generated "Release X" commit) |
+| `pins` | Empty. Add version changes by hand |
+
+It refuses the newest released major (build that from the default branch), a
+line with nothing past its last tag, and a `release/<major>.x` that was not cut
+from the tag's source commit.
+
 ## Pinning dependencies that are not built here
 
 The metapackages also require packages this repository does not build — add-ons
